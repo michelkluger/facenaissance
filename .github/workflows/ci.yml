@@ -45,7 +45,8 @@ jobs:
             libxcursor-dev \
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
-            libv4l-dev
+            libv4l-dev \
+            libgtk-3-dev
 
       - name: Build
         run: cargo build --release

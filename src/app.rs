@@ -60,9 +60,13 @@ struct GalleryItem {
 
 impl ClassicMeApp {
     pub fn new(_cc: &CreationContext<'_>) -> Result<Self> {
-        let models_dir = PathBuf::from("models");
-        let paintings_dir = PathBuf::from("assets/paintings");
-        let cache_path = PathBuf::from("cache/paintings.json");
+        // Look for assets relative to cwd first, then walk up from the
+        // executable so double-clicking the .exe from anywhere still works.
+        let root = resolve_project_root();
+        let models_dir = root.join("models");
+        let paintings_dir = root.join("assets/paintings");
+        let cache_path = root.join("cache/paintings.json");
+        log::info!("using project root: {}", root.display());
 
         let worker = pipeline::spawn(models_dir, paintings_dir, cache_path);
 
@@ -708,6 +712,33 @@ fn open_in_file_manager(path: &std::path::Path) {
     {
         let _ = std::process::Command::new("xdg-open").arg(path).spawn();
     }
+}
+
+/// Resolve where the project root is — where `models/` and
+/// `assets/paintings/` live. Checks (in order):
+///   1. the current working directory
+///   2. the directory containing the running executable
+///   3. the executable's parent-of-parent (covers `target/release/` layout)
+///   4. two levels up (covers `target/release/<target>/` for cross-compiled)
+fn resolve_project_root() -> std::path::PathBuf {
+    if std::path::Path::new("models").is_dir() {
+        return std::env::current_dir().unwrap_or_else(|_| ".".into());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.as_path();
+        for _ in 0..4 {
+            if let Some(parent) = dir.parent() {
+                if parent.join("models").is_dir() {
+                    return parent.to_path_buf();
+                }
+                dir = parent;
+            } else {
+                break;
+            }
+        }
+    }
+    // Fallback: stick with cwd; the pipeline will surface a clear error.
+    std::env::current_dir().unwrap_or_else(|_| ".".into())
 }
 
 fn rgb_to_texture(ctx: &egui::Context, img: &RgbImage, name: &str) -> TextureHandle {

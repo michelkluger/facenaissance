@@ -550,31 +550,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "classic-me"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossbeam-channel",
- "eframe",
- "egui",
- "egui_extras",
- "env_logger",
- "image",
- "imageproc",
- "log",
- "ndarray 0.16.1",
- "nokhwa",
- "once_cell",
- "ort",
- "parking_lot",
- "rayon",
- "rfd",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1189,6 +1164,31 @@ dependencies = [
  "rayon-core",
  "smallvec",
  "zune-inflate",
+]
+
+[[package]]
+name = "facenaissance"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossbeam-channel",
+ "eframe",
+ "egui",
+ "egui_extras",
+ "env_logger",
+ "image",
+ "imageproc",
+ "log",
+ "ndarray 0.16.1",
+ "nokhwa",
+ "once_cell",
+ "ort",
+ "parking_lot",
+ "rayon",
+ "rfd",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
