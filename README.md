@@ -1,5 +1,8 @@
 # facenaissance
 
+<img width="1919" height="1141" alt="image" src="https://github.com/user-attachments/assets/d731e1b3-533e-49cd-acf3-e6c893bca5fd" />
+
+
 [![CI](https://github.com/michelkluger/facenaissance/actions/workflows/ci.yml/badge.svg)](https://github.com/michelkluger/facenaissance/actions/workflows/ci.yml)
 
 Upload a photo (or snap one with your webcam) and see yourself fitted into
