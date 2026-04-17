@@ -1,0 +1,14 @@
+/target
+/cache
+/debug
+/output
+/models/*.onnx
+/models/*.bin
+/assets/paintings/*.jpg
+/assets/paintings/*.jpeg
+/assets/paintings/*.png
+/assets/paintings/*.json
+
+# Keep Cargo.lock in a binary crate for reproducible builds; only uncomment
+# if you have a specific reason to exclude it.
+# Cargo.lock

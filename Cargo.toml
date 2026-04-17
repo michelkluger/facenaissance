@@ -1,0 +1,45 @@
+[package]
+name = "facenaissance"
+version = "0.1.0"
+edition = "2021"
+description = "Fit your face into classical paintings using ONNX face-swap models."
+repository = "https://github.com/michelkluger/facenaissance"
+license = "MIT"
+
+[dependencies]
+# UI
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.29"
+egui_extras = { version = "0.29", features = ["image"] }
+
+# Camera
+nokhwa = { version = "0.10", features = ["input-native"] }
+
+# Image processing
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+imageproc = "0.25"
+
+# ONNX runtime (InsightFace models)
+ort = { version = "2.0.0-rc.9", features = ["download-binaries"] }
+ndarray = "0.16"
+
+# Misc
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+once_cell = "1"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+log = "0.4"
+env_logger = "0.11"
+rayon = "1.10"
+rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
