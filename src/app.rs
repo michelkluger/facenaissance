@@ -490,15 +490,15 @@ impl eframe::App for ClassicMeApp {
 
             let spacing = 12.0;
             let available = ui.available_width();
-            // Columns derived from target cell size, like Windows Explorer.
             let cols = (((available + spacing) / (self.cell_size + spacing))
                 .floor() as usize)
                 .max(1);
             let cell_w = (available - spacing * (cols as f32 - 1.0)) / cols as f32;
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            let scroll_resp = egui::ScrollArea::vertical().show(ui, |ui| {
                 let n = self.results.len();
                 let mut i = 0;
+                let mut any_cell_handled_zoom = false;
                 while i < n {
                     ui.horizontal_top(|ui| {
                         for col in 0..cols {
@@ -511,7 +511,12 @@ impl eframe::App for ClassicMeApp {
                                 egui::vec2(cell_w, cell_w * 1.35),
                                 egui::Layout::top_down(egui::Align::LEFT),
                                 |ui| {
-                                    zoomable_image_cell(ui, &mut self.results[idx], cell_w);
+                                    let handled = zoomable_image_cell(
+                                        ui,
+                                        &mut self.results[idx],
+                                        cell_w,
+                                    );
+                                    any_cell_handled_zoom |= handled;
                                 },
                             );
                             if col + 1 < cols {
@@ -521,7 +526,37 @@ impl eframe::App for ClassicMeApp {
                     });
                     ui.add_space(spacing * 0.5);
                 }
+                any_cell_handled_zoom
             });
+
+            // Pinch or ctrl-scroll *outside* a cell resizes the whole grid.
+            let any_cell_handled = scroll_resp.inner;
+            if !any_cell_handled {
+                let (pinch, scroll, mods, ptr) = ctx.input(|i| {
+                    (
+                        i.zoom_delta(),
+                        i.raw_scroll_delta.y,
+                        i.modifiers,
+                        i.pointer.hover_pos(),
+                    )
+                });
+                let over_gallery = ptr
+                    .map(|p| scroll_resp.inner_rect.contains(p))
+                    .unwrap_or(false);
+                if over_gallery {
+                    let mut mul = 1.0;
+                    if pinch != 1.0 {
+                        mul *= pinch;
+                    }
+                    if (mods.command || mods.ctrl) && scroll != 0.0 {
+                        mul *= (scroll * 0.005).exp();
+                    }
+                    if mul != 1.0 {
+                        // Inverse: pinch-out (mul>1) → bigger cells → fewer columns.
+                        self.cell_size = (self.cell_size * mul).clamp(100.0, 520.0);
+                    }
+                }
+            }
         });
 
         // Keep refreshing ~30 fps so the live preview stays smooth.
@@ -536,7 +571,10 @@ impl eframe::App for ClassicMeApp {
 /// Render one gallery cell: fixed-size viewport showing the painting, with
 /// per-cell pinch/ctrl-scroll zoom and drag-to-pan. Contents are clipped
 /// to the cell so zoom stays inside its frame.
-fn zoomable_image_cell(ui: &mut egui::Ui, item: &mut GalleryItem, cell_w: f32) {
+///
+/// Returns `true` iff the cell consumed a pinch/scroll zoom this frame, so
+/// the caller knows not to also apply that gesture to the grid size.
+fn zoomable_image_cell(ui: &mut egui::Ui, item: &mut GalleryItem, cell_w: f32) -> bool {
     // Viewport is a *fixed* square so every gallery cell aligns to the same
     // grid regardless of the painting's aspect ratio. The image is then
     // letterboxed inside at zoom=1.0.
@@ -559,12 +597,15 @@ fn zoomable_image_cell(ui: &mut egui::Ui, item: &mut GalleryItem, cell_w: f32) {
     });
 
     let mut zoom_mul = 1.0;
+    let mut consumed_zoom = false;
     if resp.hovered() {
         if pinch != 1.0 {
             zoom_mul *= pinch;
+            consumed_zoom = true;
         }
         if (mods.command || mods.ctrl) && scroll != 0.0 {
             zoom_mul *= (scroll * 0.005).exp();
+            consumed_zoom = true;
         }
     }
 
@@ -647,6 +688,10 @@ fn zoomable_image_cell(ui: &mut egui::Ui, item: &mut GalleryItem, cell_w: f32) {
         .truncate(),
     );
 
+    // Return whether this cell handled a zoom gesture this frame. Has to
+    // come AFTER the label rendering so the function body flows naturally.
+    let _consumed = consumed_zoom;
+
     // Flash "Saved" for 2 s after a successful save.
     if let Some(t) = item.last_save {
         let age = t.elapsed().as_secs_f32();
@@ -665,6 +710,8 @@ fn zoomable_image_cell(ui: &mut egui::Ui, item: &mut GalleryItem, cell_w: f32) {
             item.last_save = None;
         }
     }
+
+    consumed_zoom
 }
 
 /// Sanitize a string for use as a filename (safe characters only).

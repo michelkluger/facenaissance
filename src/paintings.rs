@@ -20,7 +20,11 @@ pub struct Painting {
     pub title: String,
     pub artist: String,
     pub path: PathBuf,
-    pub face: PaintingFace,
+    /// All faces detected in the painting, sorted by bbox area (largest first).
+    /// Swap iterates over every entry, so group portraits get all heads
+    /// replaced. Capped to avoid pathological cases (Night Watch).
+    pub faces: Vec<PaintingFace>,
+    /// ArcFace embedding of the primary (largest) face — used for ranking.
     pub embedding: Vec<f32>,
 }
 
@@ -127,7 +131,7 @@ pub fn load_or_build(
                 continue;
             }
         };
-        let faces = match analyzer.detect(&img) {
+        let mut detected = match analyzer.detect(&img) {
             Ok(f) => f,
             Err(e) => {
                 log::warn!("detect failed on {}: {e:?}", path.display());
@@ -135,11 +139,20 @@ pub fn load_or_build(
                 continue;
             }
         };
-        let Some(face) = crate::face::largest_face(&faces).cloned() else {
+        if detected.is_empty() {
             rejected += 1;
             continue;
-        };
-        let embedding = match analyzer.embed(&img, &face) {
+        }
+        // Sort by bbox area descending. Cap at 4 so a "Night Watch"-style
+        // group portrait doesn't make one painting take 20 × longer to swap.
+        detected.sort_by(|a, b| {
+            let aa = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
+            let bb = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
+            bb.partial_cmp(&aa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        detected.truncate(4);
+        let primary = detected[0].clone();
+        let embedding = match analyzer.embed(&img, &primary) {
             Ok(e) => e,
             Err(e) => {
                 log::warn!("embed failed on {}: {e:?}", path.display());
@@ -147,6 +160,7 @@ pub fn load_or_build(
                 continue;
             }
         };
+        let faces: Vec<PaintingFace> = detected.iter().map(PaintingFace::from).collect();
 
         let manifest_path = path.with_extension("json");
         let manifest: Manifest = std::fs::read(&manifest_path)
@@ -159,7 +173,7 @@ pub fn load_or_build(
             title: manifest.title.unwrap_or_else(|| prettify(&name)),
             artist: manifest.artist.unwrap_or_else(|| "Unknown".into()),
             path,
-            face: (&face).into(),
+            faces,
             embedding,
         });
         if out.len() % 25 == 0 {
@@ -177,9 +191,9 @@ pub fn load_or_build(
     // We keep the first occurrence (highest detection score) and drop
     // later near-duplicates.
     out.sort_by(|a, b| {
-        b.face.score
-            .partial_cmp(&a.face.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        let sa = a.faces.first().map(|f| f.score).unwrap_or(0.0);
+        let sb = b.faces.first().map(|f| f.score).unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut kept: Vec<Painting> = Vec::with_capacity(out.len());
     let mut seen_titles: std::collections::HashSet<String> = Default::default();

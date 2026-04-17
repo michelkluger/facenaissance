@@ -172,15 +172,32 @@ fn run(
                     }
                 },
             };
-            let target_face: Face = (&p.face).into();
-            match swapper.swap_with_latent(base, &target_face, &latent, Some(&mut timings)) {
-                Ok(img) => results.push(SwapResult {
+            // Iterate every detected face in this painting, chaining swaps
+            // so group portraits get all heads replaced.
+            let mut current: Option<RgbImage> = None;
+            for face_meta in &p.faces {
+                let target_face: Face = face_meta.into();
+                let input: &RgbImage = current.as_ref().unwrap_or(base);
+                match swapper.swap_with_latent(
+                    input,
+                    &target_face,
+                    &latent,
+                    Some(&mut timings),
+                ) {
+                    Ok(img) => current = Some(img),
+                    Err(e) => log::warn!(
+                        "swap failed for {} face: {e:?}",
+                        p.title
+                    ),
+                }
+            }
+            if let Some(img) = current {
+                results.push(SwapResult {
                     painting_title: p.title.clone(),
                     painting_artist: p.artist.clone(),
                     similarity: score,
                     image: img,
-                }),
-                Err(e) => log::warn!("swap failed for {}: {e:?}", p.title),
+                });
             }
         }
         let wall = t_batch.elapsed();
