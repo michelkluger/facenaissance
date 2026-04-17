@@ -63,11 +63,38 @@ pub fn load_or_build(
     analyzer: &mut FaceAnalyzer,
 ) -> Result<Vec<Painting>> {
     if let Ok(bytes) = std::fs::read(cache_path) {
-        if let Ok(cached) = serde_json::from_slice::<Vec<Painting>>(&bytes) {
-            log::info!("loaded {} paintings from cache", cached.len());
-            if !cached.is_empty() {
+        if let Ok(mut cached) = serde_json::from_slice::<Vec<Painting>>(&bytes) {
+            // Old caches may have stored relative paths (resolved from a
+            // specific cwd). Always rewrite to absolute `paintings_dir /
+            // <filename>` so the cache is portable across launch dirs.
+            let mut migrated = 0usize;
+            for p in cached.iter_mut() {
+                let needs_fix = !p.path.is_absolute() || !p.path.exists();
+                if needs_fix {
+                    if let Some(fname) = p.path.file_name() {
+                        let candidate = paintings_dir.join(fname);
+                        if candidate.exists() {
+                            p.path = candidate;
+                            migrated += 1;
+                        }
+                    }
+                }
+            }
+            if migrated > 0 {
+                log::info!(
+                    "migrated {} painting paths to absolute, rewriting cache",
+                    migrated
+                );
+                if let Some(parent) = cache_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(cache_path, serde_json::to_vec_pretty(&cached)?);
+            }
+            if !cached.is_empty() && cached.iter().all(|p| p.path.exists()) {
+                log::info!("loaded {} paintings from cache", cached.len());
                 return Ok(cached);
             }
+            log::warn!("cache paths still invalid, reindexing from scratch");
         }
     }
 

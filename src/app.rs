@@ -39,6 +39,10 @@ pub struct ClassicMeApp {
     live_tex: Option<TextureHandle>,
     user_face_tex: Option<TextureHandle>,
     top_n: usize,
+    /// Target width for each gallery thumbnail, in pixels. The grid uses
+    /// this to compute how many columns to show, like a Windows Explorer
+    /// folder view.
+    cell_size: f32,
     processing: bool,
 }
 
@@ -79,6 +83,7 @@ impl ClassicMeApp {
             live_tex: None,
             user_face_tex: None,
             top_n: 4,
+            cell_size: 260.0,
             processing: false,
         })
     }
@@ -410,6 +415,11 @@ impl eframe::App for ClassicMeApp {
                             self.export_all();
                         }
                     });
+                    ui.add(
+                        egui::Slider::new(&mut self.cell_size, 100.0..=520.0)
+                            .text("size")
+                            .fixed_decimals(0),
+                    );
                 });
             });
 
@@ -478,25 +488,25 @@ impl eframe::App for ClassicMeApp {
                 .small(),
             );
 
-            let cols = 2;
             let spacing = 12.0;
             let available = ui.available_width();
-            let cell_w = (available - spacing * (cols as f32 + 1.0)) / cols as f32;
+            // Columns derived from target cell size, like Windows Explorer.
+            let cols = (((available + spacing) / (self.cell_size + spacing))
+                .floor() as usize)
+                .max(1);
+            let cell_w = (available - spacing * (cols as f32 - 1.0)) / cols as f32;
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let n = self.results.len();
                 let mut i = 0;
                 while i < n {
                     ui.horizontal_top(|ui| {
-                        ui.add_space(spacing * 0.5);
                         for col in 0..cols {
                             if i >= n {
                                 break;
                             }
                             let idx = i;
                             i += 1;
-                            // Fixed-size cell box so long titles on one side
-                            // don't shove the other column down.
                             ui.allocate_ui_with_layout(
                                 egui::vec2(cell_w, cell_w * 1.35),
                                 egui::Layout::top_down(egui::Align::LEFT),
