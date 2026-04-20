@@ -7,18 +7,30 @@ Features:
   - Batched `action=query` imageinfo lookup.
   - Falls back to `generator=search` when a literal File: title 404s.
   - Skips files already present.
+  - Polite rate limiting (~1 req/sec) + exponential backoff on 429,
+    per https://api.wikimedia.org/wiki/Rate_limits (500/hour for
+    anonymous clients) and https://meta.wikimedia.org/wiki/User-Agent_policy.
 """
 from __future__ import annotations
 
 import json
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-UA = "classic-me-demo/0.1 (+https://github.com/local/classic-me; fetch script)"
+UA = "facenaissance/0.1 (+https://github.com/michelkluger/facenaissance; fetch script)"
 API = "https://commons.wikimedia.org/w/api.php"
+
+# Wikimedia is happy with ~1 req/sec per IP for ordinary (non-API) traffic.
+# Their documented API budget for anonymous clients is 500/hour, i.e.
+# ~1 per 7 seconds — we stay well above that in wall-clock pacing but rely
+# on burst allowance plus retries to absorb spikes.
+DOWNLOAD_SLEEP = 1.0
+# On 429 we back off exponentially: 30s, 60s, 120s, 240s (capped).
+RETRY_BACKOFFS = (30, 60, 120, 240)
 
 # slug, "File:...jpg" title, display title, artist, optional search fallback
 ITEMS: list[tuple[str, str, str, str, str]] = [
@@ -127,10 +139,40 @@ ITEMS: list[tuple[str, str, str, str, str]] = [
 ]
 
 
+def _open_with_retry(req: urllib.request.Request) -> bytes:
+    """Polite urlopen with exponential backoff on 429 and 5xx. Respects
+    the Retry-After header when the server sends one."""
+    last_exc: Exception | None = None
+    for attempt, base_wait in enumerate((0, *RETRY_BACKOFFS)):
+        if base_wait:
+            time.sleep(base_wait)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            last_exc = e
+            if e.code == 429:
+                retry_after = e.headers.get("Retry-After") if e.headers else None
+                if retry_after and retry_after.isdigit():
+                    time.sleep(min(int(retry_after), 300))
+                print(
+                    f"  [429] backing off (attempt {attempt + 1})…",
+                    file=sys.stderr,
+                )
+                continue
+            if 500 <= e.code < 600:
+                time.sleep(5 * (attempt + 1))
+                continue
+            raise
+        except Exception as e:
+            last_exc = e
+            time.sleep(3)
+    raise last_exc if last_exc else RuntimeError("_open_with_retry: exhausted")
+
+
 def get(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return r.read()
+    """GET a URL as bytes, polite-retrying transient failures."""
+    return _open_with_retry(urllib.request.Request(url, headers={"User-Agent": UA}))
 
 
 def api_query_titles(titles: list[str]) -> dict:
@@ -145,8 +187,7 @@ def api_query_titles(titles: list[str]) -> dict:
         }
     ).encode("utf-8")
     req = urllib.request.Request(API, data=body, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())
+    return json.loads(_open_with_retry(req))
 
 
 def api_search(query: str) -> str | None:
@@ -164,8 +205,7 @@ def api_search(query: str) -> str | None:
         }
     )
     req = urllib.request.Request(f"{API}?{params}", headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        j = json.loads(r.read())
+    j = json.loads(_open_with_retry(req))
     for page in j.get("query", {}).get("pages", {}).values():
         if "imageinfo" in page:
             ii = page["imageinfo"][0]
@@ -199,7 +239,7 @@ def resolve_urls(items) -> dict[str, str]:
                 url = ii.get("thumburl") or ii.get("url")
                 if url:
                     url_for[by_norm[orig][0]] = url
-        time.sleep(0.2)
+        time.sleep(DOWNLOAD_SLEEP)
 
     # For anything still missing, try search fallback.
     for slug, _, _, _, fallback in items:
@@ -210,7 +250,7 @@ def resolve_urls(items) -> dict[str, str]:
             if url:
                 url_for[slug] = url
                 print(f"[search-ok] {slug}  ({fallback})")
-            time.sleep(0.3)
+            time.sleep(DOWNLOAD_SLEEP)
         except Exception as e:
             print(f"[search-fail] {slug}: {e}", file=sys.stderr)
     return url_for
@@ -244,7 +284,7 @@ def main() -> int:
             )
             print(f"[ok]   {slug}  ({len(data)//1024} KB)")
             ok += 1
-            time.sleep(0.2)
+            time.sleep(DOWNLOAD_SLEEP)
         except Exception as e:
             print(f"[fail] {slug}: {e}", file=sys.stderr)
 

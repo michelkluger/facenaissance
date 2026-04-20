@@ -78,34 +78,44 @@ BLOCK_SUBSTRINGS = (
 )
 
 
-def http_json(url: str) -> dict:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read())
-
-
-def http_bytes(url: str, attempts: int = 4) -> bytes:
-    """GET with polite retry/backoff — Wikimedia rate-limits around 1 req/s."""
+def _open_with_retry(req: urllib.request.Request, attempts: int = 5) -> bytes:
+    """urlopen with exponential backoff. Wikimedia API limit is 500/hour
+    for anonymous clients; upload.wikimedia.org tolerates ~1 req/s bursts
+    before HAProxy 429s. Respects Retry-After when provided."""
+    backoffs = (0, 30, 60, 120, 240)
     last_exc: Exception | None = None
-    for attempt in range(attempts):
+    for i, base_wait in enumerate(backoffs[:attempts]):
+        if base_wait:
+            time.sleep(base_wait)
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA})
             with urllib.request.urlopen(req, timeout=120) as r:
                 return r.read()
         except urllib.error.HTTPError as e:
             last_exc = e
             if e.code == 429:
                 retry_after = e.headers.get("Retry-After") if e.headers else None
-                wait = int(retry_after) if retry_after and retry_after.isdigit() else 15 * (attempt + 1)
-                time.sleep(min(wait, 60))
+                if retry_after and retry_after.isdigit():
+                    time.sleep(min(int(retry_after), 300))
+                print(f"  [429] backing off (attempt {i + 1})…", file=sys.stderr)
                 continue
             if e.code in (500, 502, 503, 504):
-                time.sleep(5 * (attempt + 1))
+                time.sleep(5 * (i + 1))
                 continue
             raise
         except Exception as e:
             last_exc = e
             time.sleep(3)
+    raise last_exc if last_exc else RuntimeError("http: exhausted retries")
+
+
+def http_json(url: str) -> dict:
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    return json.loads(_open_with_retry(req))
+
+
+def http_bytes(url: str) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    return _open_with_retry(req)
     raise last_exc if last_exc else RuntimeError("http_bytes: exhausted retries")
 
 
@@ -154,7 +164,7 @@ def walk_category(category: str, hard_limit: int) -> list[tuple[str, str]]:
         cmcontinue = cont.get("gcmcontinue")
         if not cmcontinue:
             break
-        time.sleep(0.15)
+        time.sleep(1.0)
     return out
 
 
@@ -240,7 +250,10 @@ def main() -> int:
             ok += 1
             if ok % 25 == 0:
                 print(f"  [{ok}] {slug}")
-            time.sleep(0.8)  # ~1 req/s — Wikimedia's polite-client threshold
+            # ~1 req/s matches Wikimedia's polite-client expectation; see
+            # https://api.wikimedia.org/wiki/Rate_limits (500/hour anon) and
+            # https://meta.wikimedia.org/wiki/User-Agent_policy.
+            time.sleep(1.0)
         except Exception as e:
             fail += 1
             if fail < 10:
