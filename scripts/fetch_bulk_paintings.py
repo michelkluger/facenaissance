@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-UA = "classic-me-demo/0.1 (+https://github.com/local/classic-me; bulk fetch)"
+UA = "facenaissance/0.1 (+https://github.com/michelkluger/facenaissance; bulk fetch)"
 API = "https://commons.wikimedia.org/w/api.php"
 
 # Prioritised list of portrait-heavy categories. We walk them in order and

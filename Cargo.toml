@@ -38,6 +38,9 @@ rayon = "1.10"
 # and AppKit-native dialogs on macOS. The CI installs libgtk-3-dev for Linux.
 rfd = "0.15"
 
+# Small sync HTTP client for the in-app starter-gallery downloader.
+ureq = { version = "2", features = ["json", "tls"], default-features = false }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

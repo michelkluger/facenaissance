@@ -1,4 +1,4 @@
-# Fetch the ONNX models required by classic-me into ./models/.
+# Fetch the ONNX models required by facenaissance into ./models/.
 # Run from the project root:   powershell -ExecutionPolicy Bypass -File scripts\download_models.ps1
 
 $ErrorActionPreference = "Stop"

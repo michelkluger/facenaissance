@@ -12,6 +12,7 @@
 mod align;
 mod app;
 mod camera;
+mod downloader;
 mod face;
 mod paintings;
 mod pipeline;
@@ -32,7 +33,7 @@ fn main() -> Result<()> {
     eframe::run_native(
         "facenaissance",
         native_options,
-        Box::new(|cc| Ok(Box::new(app::ClassicMeApp::new(cc)?))),
+        Box::new(|cc| Ok(Box::new(app::FacenaissanceApp::new(cc)?))),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))
 }

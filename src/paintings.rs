@@ -310,3 +310,115 @@ pub fn rank(user_embedding: &[f32], gallery: &[Painting]) -> Vec<(usize, f32)> {
 pub fn load_image(p: &Painting) -> Result<RgbImage> {
     Ok(image::open(&p.path)?.to_rgb8())
 }
+
+/// Scan `paintings_dir` for image files not already in `gallery`, index
+/// the new ones (face detection + ArcFace embedding), append them to the
+/// in-memory gallery, and rewrite the cache. Cheap — O(new files), not
+/// O(total).
+///
+/// Returns the number of paintings that were actually added.
+pub fn append_new(
+    gallery: &mut Vec<Painting>,
+    paintings_dir: &Path,
+    cache_path: &Path,
+    analyzer: &mut FaceAnalyzer,
+) -> Result<usize> {
+    use std::collections::HashSet;
+
+    let known: HashSet<String> = gallery.iter().map(|p| p.name.clone()).collect();
+    let known_norm: HashSet<String> =
+        gallery.iter().map(|p| normalize_title(&p.title)).collect();
+
+    let entries = std::fs::read_dir(paintings_dir)
+        .with_context(|| format!("read {}", paintings_dir.display()))?;
+    let mut added = 0usize;
+
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if !matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png") {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("painting")
+            .to_string();
+        if known.contains(&name) {
+            continue;
+        }
+
+        let img = match image::open(&path) {
+            Ok(i) => i.to_rgb8(),
+            Err(e) => {
+                log::warn!("cannot decode {}: {e}", path.display());
+                continue;
+            }
+        };
+        let mut detected = match analyzer.detect(&img) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("detect failed on {}: {e:?}", path.display());
+                continue;
+            }
+        };
+        if detected.is_empty() {
+            continue;
+        }
+        detected.sort_by(|a, b| {
+            let aa = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
+            let bb = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
+            bb.partial_cmp(&aa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        detected.truncate(4);
+        let primary = detected[0].clone();
+        let embedding = match analyzer.embed(&img, &primary) {
+            Ok(e) => e,
+            Err(e) => {
+                log::warn!("embed failed on {}: {e:?}", path.display());
+                continue;
+            }
+        };
+
+        // Dedupe incrementally against what's already in the gallery.
+        let manifest_path = path.with_extension("json");
+        let manifest: Manifest = std::fs::read(&manifest_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let title = manifest.title.unwrap_or_else(|| prettify(&name));
+        let artist = manifest.artist.unwrap_or_else(|| "Unknown".into());
+        let norm = normalize_title(&title);
+        if !norm.is_empty() && known_norm.contains(&norm) {
+            continue;
+        }
+        if gallery
+            .iter()
+            .any(|q| crate::face::cosine_similarity(&embedding, &q.embedding) > 0.95)
+        {
+            continue;
+        }
+
+        let faces: Vec<PaintingFace> = detected.iter().map(PaintingFace::from).collect();
+        gallery.push(Painting {
+            name,
+            title,
+            artist,
+            path,
+            faces,
+            embedding,
+        });
+        added += 1;
+    }
+
+    if added > 0 {
+        if let Some(parent) = cache_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(cache_path, serde_json::to_vec_pretty(gallery)?)?;
+    }
+    Ok(added)
+}

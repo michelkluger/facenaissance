@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fetch the ONNX models required by classic-me into ./models/.
+# Fetch the ONNX models required by facenaissance into ./models/.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"

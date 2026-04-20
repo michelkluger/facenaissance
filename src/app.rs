@@ -7,7 +7,8 @@
 //!   └────────────────────────┴────────────────────────┘
 
 use crate::camera::{self, CameraFeed};
-use crate::pipeline::{self, SwapRequest, SwapResult, Worker, WorkerMsg};
+use crate::downloader::{self, DownloadMsg, Downloader};
+use crate::pipeline::{self, SwapRequest, SwapResult, Worker, WorkerMsg, WorkerReq};
 use anyhow::Result;
 use eframe::CreationContext;
 use egui::{ColorImage, TextureHandle, TextureOptions};
@@ -29,7 +30,7 @@ enum InputMode {
     },
 }
 
-pub struct ClassicMeApp {
+pub struct FacenaissanceApp {
     mode: InputMode,
     worker: Worker,
     status: String,
@@ -39,11 +40,21 @@ pub struct ClassicMeApp {
     live_tex: Option<TextureHandle>,
     user_face_tex: Option<TextureHandle>,
     top_n: usize,
-    /// Target width for each gallery thumbnail, in pixels. The grid uses
-    /// this to compute how many columns to show, like a Windows Explorer
-    /// folder view.
+    /// Target width for each gallery thumbnail, in pixels.
     cell_size: f32,
     processing: bool,
+    /// In-progress starter-gallery downloader (None once it's finished
+    /// or if it never started because paintings are already present).
+    downloader: Option<Downloader>,
+    /// UI-side snapshot of the downloader's progress.
+    download_progress: Option<DownloadStatus>,
+}
+
+struct DownloadStatus {
+    done: usize,
+    total: usize,
+    current: String,
+    finished: bool,
 }
 
 struct GalleryItem {
@@ -62,7 +73,7 @@ struct GalleryItem {
     last_save: Option<std::time::Instant>,
 }
 
-impl ClassicMeApp {
+impl FacenaissanceApp {
     pub fn new(_cc: &CreationContext<'_>) -> Result<Self> {
         // Look for assets relative to cwd first, then walk up from the
         // executable so double-clicking the .exe from anywhere still works.
@@ -72,7 +83,17 @@ impl ClassicMeApp {
         let cache_path = root.join("cache/paintings.json");
         log::info!("using project root: {}", root.display());
 
-        let worker = pipeline::spawn(models_dir, paintings_dir, cache_path);
+        let worker = pipeline::spawn(models_dir, paintings_dir.clone(), cache_path);
+
+        // Kick off the starter downloader if the paintings dir is sparse.
+        let downloader = if downloader::existing_count(&paintings_dir)
+            < downloader::AUTOSTART_MIN_PAINTINGS
+        {
+            log::info!("paintings dir is sparse — starting background download");
+            Some(downloader::spawn(paintings_dir))
+        } else {
+            None
+        };
 
         Ok(Self {
             mode: InputMode::Welcome,
@@ -85,6 +106,8 @@ impl ClassicMeApp {
             top_n: 4,
             cell_size: 260.0,
             processing: false,
+            downloader,
+            download_progress: None,
         })
     }
 
@@ -260,14 +283,69 @@ impl ClassicMeApp {
             frame,
             top_n: self.top_n,
         };
-        if let Err(e) = self.worker.tx_req.try_send(req) {
+        if let Err(e) = self.worker.tx_req.try_send(WorkerReq::Swap(req)) {
             self.status = format!("Busy: {e}");
             self.processing = false;
         }
     }
+
+    fn drain_downloader(&mut self) {
+        let Some(dl) = self.downloader.as_ref() else {
+            return;
+        };
+        let mut finished = false;
+        let mut reindex_now = false;
+        while let Ok(msg) = dl.rx.try_recv() {
+            match msg {
+                DownloadMsg::Resolving { total } => {
+                    self.download_progress = Some(DownloadStatus {
+                        done: 0,
+                        total,
+                        current: "Resolving URLs...".into(),
+                        finished: false,
+                    });
+                }
+                DownloadMsg::Progress { done, total, title } => {
+                    self.download_progress = Some(DownloadStatus {
+                        done,
+                        total,
+                        current: title,
+                        finished: false,
+                    });
+                }
+                DownloadMsg::Checkpoint { new_files_since_last: _ } => {
+                    // Ask the worker to incorporate the new files without
+                    // waiting for the full download to finish.
+                    reindex_now = true;
+                }
+                DownloadMsg::Done { new_files } => {
+                    self.status = format!("Downloaded {new_files} paintings.");
+                    if let Some(p) = self.download_progress.as_mut() {
+                        p.finished = true;
+                        p.done = p.total;
+                        p.current = "Done.".into();
+                    }
+                    finished = true;
+                    if new_files > 0 {
+                        reindex_now = true;
+                    }
+                }
+                DownloadMsg::Error(e) => {
+                    self.status = format!("Download error: {e}");
+                    finished = true;
+                }
+            }
+        }
+        if finished {
+            self.downloader = None;
+        }
+        if reindex_now {
+            let _ = self.worker.tx_req.try_send(WorkerReq::Reindex);
+        }
+    }
 }
 
-impl ClassicMeApp {
+impl FacenaissanceApp {
     fn draw_source_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // Snapshot the data we need so the &self.mode borrow drops before
         // we call any mutating helper on `self`.
@@ -308,6 +386,35 @@ impl ClassicMeApp {
                     .clicked()
                 {
                     self.browse_for_photo(ctx);
+                }
+
+                // Starter download progress.
+                if let Some(p) = &self.download_progress {
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.heading("Starter gallery");
+                    let frac = if p.total > 0 {
+                        (p.done as f32 / p.total as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .desired_width(w)
+                            .text(if p.finished {
+                                "Ready".to_string()
+                            } else {
+                                format!("{} / {}", p.done, p.total)
+                            }),
+                    );
+                    ui.label(
+                        egui::RichText::new(&p.current)
+                            .weak()
+                            .small(),
+                    );
+                    if !p.finished {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                    }
                 }
             }
 
@@ -390,17 +497,18 @@ impl ClassicMeApp {
     }
 }
 
-impl eframe::App for ClassicMeApp {
+impl eframe::App for FacenaissanceApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.refresh_live(ctx);
         self.drain_worker(ctx);
+        self.drain_downloader();
         self.handle_dropped_files(ctx);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             // Row 1: title + right-aligned controls. Status goes on its own
             // row below so variable-length text can't shove things around.
             ui.horizontal(|ui| {
-                ui.heading("classic-me");
+                ui.heading("facenaissance");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     const STEPS: [usize; 8] = [2, 4, 8, 16, 32, 64, 128, 256];
                     egui::ComboBox::from_label("results")

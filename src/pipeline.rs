@@ -26,6 +26,14 @@ pub struct SwapRequest {
     pub top_n: usize,
 }
 
+/// Anything the UI can ask the worker to do.
+pub enum WorkerReq {
+    Swap(SwapRequest),
+    /// Re-scan `assets/paintings/`, rebuild embeddings cache, replace
+    /// the in-memory gallery. Sent after the starter downloader finishes.
+    Reindex,
+}
+
 /// Message from the worker back to the UI.
 pub enum WorkerMsg {
     /// Free-text status line + optional (done, total) progress tuple.
@@ -47,12 +55,12 @@ impl WorkerMsg {
 }
 
 pub struct Worker {
-    pub tx_req: Sender<SwapRequest>,
+    pub tx_req: Sender<WorkerReq>,
     pub rx_msg: Receiver<WorkerMsg>,
 }
 
 pub fn spawn(models_dir: PathBuf, paintings_dir: PathBuf, cache_path: PathBuf) -> Worker {
-    let (tx_req, rx_req) = bounded::<SwapRequest>(2);
+    let (tx_req, rx_req) = bounded::<WorkerReq>(4);
     let (tx_msg, rx_msg) = bounded::<WorkerMsg>(16);
 
     thread::Builder::new()
@@ -68,7 +76,7 @@ pub fn spawn(models_dir: PathBuf, paintings_dir: PathBuf, cache_path: PathBuf) -
 }
 
 fn run(
-    rx: Receiver<SwapRequest>,
+    rx: Receiver<WorkerReq>,
     tx: Sender<WorkerMsg>,
     models_dir: PathBuf,
     paintings_dir: PathBuf,
@@ -79,14 +87,15 @@ fn run(
     let mut swapper = Swapper::load(&models_dir)?;
 
     let _ = tx.send(WorkerMsg::text("Indexing paintings..."));
-    let gallery = paintings::load_or_build(&paintings_dir, &cache_path, &mut analyzer)?;
-    if gallery.is_empty() {
-        return Err(anyhow!(
-            "no paintings found in {} — drop classical portraits there",
-            paintings_dir.display()
-        ));
-    }
-    let _ = tx.send(WorkerMsg::text(format!("Ready ({} paintings).", gallery.len())));
+    // Don't fail if paintings dir is empty — the starter downloader may
+    // still be running. We'll pick them up on a later Reindex message.
+    let mut gallery = paintings::load_or_build(&paintings_dir, &cache_path, &mut analyzer)
+        .unwrap_or_default();
+    let _ = tx.send(if gallery.is_empty() {
+        WorkerMsg::text("Waiting for paintings to download...")
+    } else {
+        WorkerMsg::text(format!("Ready ({} paintings).", gallery.len()))
+    });
 
     // In-process cache of decoded painting RgbImages keyed by name. First
     // time a painting is used we decode its JPEG (~50 ms); subsequent
@@ -94,7 +103,46 @@ fn run(
     let mut image_cache: std::collections::HashMap<String, RgbImage> =
         std::collections::HashMap::new();
 
-    while let Ok(req) = rx.recv() {
+    while let Ok(work) = rx.recv() {
+        let req = match work {
+            WorkerReq::Reindex => {
+                if gallery.is_empty() {
+                    // First time: do the (potentially) full build.
+                    gallery = paintings::load_or_build(
+                        &paintings_dir,
+                        &cache_path,
+                        &mut analyzer,
+                    )
+                    .unwrap_or_default();
+                } else {
+                    // Incremental: only touch paintings not yet indexed.
+                    match paintings::append_new(
+                        &mut gallery,
+                        &paintings_dir,
+                        &cache_path,
+                        &mut analyzer,
+                    ) {
+                        Ok(n) if n > 0 => log::info!("appended {n} paintings to gallery"),
+                        Ok(_) => {}
+                        Err(e) => log::warn!("append_new failed: {e:?}"),
+                    }
+                }
+                let _ = tx.send(WorkerMsg::text(format!(
+                    "Ready ({} paintings).",
+                    gallery.len()
+                )));
+                continue;
+            }
+            WorkerReq::Swap(r) => r,
+        };
+
+        if gallery.is_empty() {
+            let _ = tx.send(WorkerMsg::Error(
+                "No paintings indexed yet — let the starter download finish.".into(),
+            ));
+            continue;
+        }
+
         let _ = tx.send(WorkerMsg::text("Detecting your face..."));
         let faces = analyzer.detect(&req.frame)?;
         let Some(user_face) = largest_face(&faces).cloned() else {
