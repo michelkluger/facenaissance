@@ -9,7 +9,7 @@
 use crate::align::{self, INSWAPPER_TEMPLATE_128};
 use crate::face::Face;
 use anyhow::{Context, Result};
-use image::{Rgb, RgbImage};
+use image::RgbImage;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use std::path::Path;
@@ -34,20 +34,70 @@ pub struct Swapper {
     /// L2-normalised) before being fed to the model — without this the
     /// network emits garbage.
     emap: Vec<f32>,
+    /// 128×128 feathered oval mask. Identical for every swap, so we build it
+    /// once at load time and reuse it in `paste_back`.
+    mask: image::GrayImage,
 }
 
 impl Swapper {
     pub fn load(models_dir: &Path) -> Result<Self> {
-        let path = models_dir.join("inswapper_128.onnx");
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let session = Session::builder()
+        Self::load_with_threads(models_dir, threads)
+    }
+
+    /// Like `load`, but lets the caller control intra-op thread count — used
+    /// when building a pool of parallel swappers so their threadpools don't
+    /// oversubscribe the CPU.
+    ///
+    /// On Windows the session additionally registers the DirectML execution
+    /// provider, which pushes inswapper inference onto any DX12-capable GPU.
+    /// Ops DML can't run fall back to CPU transparently. Set
+    /// `FACENAISSANCE_NO_DML=1` to disable DML at startup (useful if a
+    /// driver/GPU combo produces glitched output).
+    pub fn load_with_threads(models_dir: &Path, threads: usize) -> Result<Self> {
+        let path = models_dir.join("inswapper_128.onnx");
+        let mut builder = Session::builder()
             .map_err(ort_err)?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(ort_err)?
             .with_intra_threads(threads)
-            .map_err(ort_err)?
+            .map_err(ort_err)?;
+
+        #[cfg(target_os = "windows")]
+        let mut builder = {
+            let disable_dml = std::env::var("FACENAISSANCE_NO_DML")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if disable_dml {
+                log::info!("inswapper: DirectML disabled via FACENAISSANCE_NO_DML");
+                builder
+            } else {
+                use ort::execution_providers::DirectMLExecutionProvider;
+                match builder
+                    .with_execution_providers([DirectMLExecutionProvider::default().build()])
+                {
+                    Ok(b) => {
+                        log::info!("inswapper: DirectML execution provider enabled");
+                        b
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "inswapper: could not register DirectML EP ({e}); falling back to CPU"
+                        );
+                        Session::builder()
+                            .map_err(ort_err)?
+                            .with_optimization_level(GraphOptimizationLevel::Level3)
+                            .map_err(ort_err)?
+                            .with_intra_threads(threads)
+                            .map_err(ort_err)?
+                    }
+                }
+            }
+        };
+
+        let session = builder
             .commit_from_file(&path)
             .map_err(ort_err)
             .with_context(|| format!("load swapper from {}", path.display()))?;
@@ -71,7 +121,9 @@ impl Swapper {
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
 
-        Ok(Self { session, emap })
+        let mask = build_oval_mask(128, 128, 0.85);
+
+        Ok(Self { session, emap, mask })
     }
 
     /// Apply emap matrix to an L2-normalised 512-d embedding and re-normalise.
@@ -148,7 +200,7 @@ impl Swapper {
         }
 
         let t_paste = std::time::Instant::now();
-        let result = paste_back(target_image, &swapped, m);
+        let result = paste_back(target_image, &swapped, &self.mask, m);
         let paste_ms = t_paste.elapsed();
 
         if let Some(t) = timings {
@@ -162,77 +214,146 @@ impl Swapper {
 }
 
 fn image_to_chw_01(img: &RgbImage) -> Vec<f32> {
-    let w = img.width();
-    let h = img.height();
-    let plane = (w * h) as usize;
+    let w = img.width() as usize;
+    let h = img.height() as usize;
+    let plane = w * h;
+    let raw = img.as_raw(); // packed RGBRGB...
     let mut data = vec![0.0f32; 3 * plane];
-    for y in 0..h {
-        for x in 0..w {
-            let p = img.get_pixel(x, y);
-            let i = (y * w + x) as usize;
-            data[i] = p[0] as f32 / 255.0;
-            data[plane + i] = p[1] as f32 / 255.0;
-            data[2 * plane + i] = p[2] as f32 / 255.0;
-        }
+    let (r_plane, rest) = data.split_at_mut(plane);
+    let (g_plane, b_plane) = rest.split_at_mut(plane);
+    let scale = 1.0 / 255.0;
+    for i in 0..plane {
+        let p = i * 3;
+        r_plane[i] = raw[p] as f32 * scale;
+        g_plane[i] = raw[p + 1] as f32 * scale;
+        b_plane[i] = raw[p + 2] as f32 * scale;
     }
     data
 }
 
 fn chw_to_image(data: &[f32], w: u32, h: u32) -> RgbImage {
-    let mut img = RgbImage::new(w, h);
     let plane = (w * h) as usize;
-    for y in 0..h {
-        for x in 0..w {
-            let i = (y * w + x) as usize;
-            let r = (data[i].clamp(0.0, 1.0) * 255.0) as u8;
-            let g = (data[plane + i].clamp(0.0, 1.0) * 255.0) as u8;
-            let b = (data[2 * plane + i].clamp(0.0, 1.0) * 255.0) as u8;
-            img.put_pixel(x, y, Rgb([r, g, b]));
-        }
+    let r_plane = &data[0..plane];
+    let g_plane = &data[plane..2 * plane];
+    let b_plane = &data[2 * plane..3 * plane];
+    let mut out = vec![0u8; plane * 3];
+    for i in 0..plane {
+        let p = i * 3;
+        out[p] = (r_plane[i].clamp(0.0, 1.0) * 255.0) as u8;
+        out[p + 1] = (g_plane[i].clamp(0.0, 1.0) * 255.0) as u8;
+        out[p + 2] = (b_plane[i].clamp(0.0, 1.0) * 255.0) as u8;
     }
-    img
+    RgbImage::from_raw(w, h, out).expect("chw_to_image from_raw")
 }
 
-fn paste_back(base: &RgbImage, crop: &RgbImage, m: [[f32; 3]; 2]) -> RgbImage {
-    use rayon::prelude::*;
-    let mask = build_oval_mask(128, 128, 0.85);
+/// Fused bbox-limited paste: warp the 128×128 crop+mask into the base frame
+/// *only within the aligned crop's footprint*, doing bilinear sampling and
+/// alpha blending in a single pass. Avoids the two full-frame `warp_into`
+/// calls and the full-frame blend that the old implementation did.
+fn paste_back(
+    base: &RgbImage,
+    crop: &RgbImage,
+    mask: &image::GrayImage,
+    m: [[f32; 3]; 2],
+) -> RgbImage {
+    let bw = base.width() as i32;
+    let bh = base.height() as i32;
+    let cw = crop.width() as i32; // 128
+    let ch = crop.height() as i32; // 128
+
+    // Compute the base-image bbox that the 128×128 aligned square projects
+    // back to, by sending the four corners through the inverse affine.
     let inv = invert_affine(m);
-    let warped_crop = warp_rgb_with_affine(crop, inv, base.width(), base.height());
-    let warped_mask = warp_gray_with_affine(&mask, inv, base.width(), base.height());
+    let corners = [
+        (0.0f32, 0.0f32),
+        (cw as f32, 0.0),
+        (0.0, ch as f32),
+        (cw as f32, ch as f32),
+    ];
+    let (mut minx, mut miny) = (f32::INFINITY, f32::INFINITY);
+    let (mut maxx, mut maxy) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for (ax, ay) in corners {
+        let px = inv[0][0] * ax + inv[0][1] * ay + inv[0][2];
+        let py = inv[1][0] * ax + inv[1][1] * ay + inv[1][2];
+        if px < minx { minx = px; }
+        if py < miny { miny = py; }
+        if px > maxx { maxx = px; }
+        if py > maxy { maxy = py; }
+    }
+    let x0 = (minx.floor() as i32).clamp(0, bw);
+    let y0 = (miny.floor() as i32).clamp(0, bh);
+    let x1 = ((maxx.ceil() as i32) + 1).clamp(0, bw);
+    let y1 = ((maxy.ceil() as i32) + 1).clamp(0, bh);
 
-    let w = base.width() as usize;
-    let h = base.height() as usize;
-    let base_buf = base.as_raw(); // &[u8], RGB RGB RGB...
-    let crop_buf = warped_crop.as_raw();
-    let mask_buf = warped_mask.as_raw();
+    let base_buf = base.as_raw();
+    let crop_buf = crop.as_raw();
+    let mask_buf = mask.as_raw();
+    let mut out_vec: Vec<u8> = base_buf.clone();
 
-    // Row-parallel alpha composite. For a 1000×1000 painting this drops the
-    // blend step from ~80ms to ~15ms on 8 cores.
-    let mut out_vec = vec![0u8; w * h * 3];
-    out_vec
-        .par_chunks_mut(w * 3)
-        .enumerate()
-        .for_each(|(y, row)| {
-            for x in 0..w {
-                let mi = y * w + x;
-                let a = mask_buf[mi] as f32 * (1.0 / 255.0);
-                let pi = mi * 3;
-                if a <= 0.0 {
-                    row[x * 3] = base_buf[pi];
-                    row[x * 3 + 1] = base_buf[pi + 1];
-                    row[x * 3 + 2] = base_buf[pi + 2];
-                } else {
-                    let ia = 1.0 - a;
-                    row[x * 3] =
-                        (crop_buf[pi] as f32 * a + base_buf[pi] as f32 * ia) as u8;
-                    row[x * 3 + 1] =
-                        (crop_buf[pi + 1] as f32 * a + base_buf[pi + 1] as f32 * ia) as u8;
-                    row[x * 3 + 2] =
-                        (crop_buf[pi + 2] as f32 * a + base_buf[pi + 2] as f32 * ia) as u8;
-                }
+    let cw_us = cw as usize;
+    // Per-row we only need to recompute (ax,ay) from scratch at x=x0, then
+    // increment by (m[0][0], m[1][0]) for each x++.
+    for y in y0..y1 {
+        let base_ax = m[0][1] * (y as f32) + m[0][2];
+        let base_ay = m[1][1] * (y as f32) + m[1][2];
+        let mut ax = base_ax + m[0][0] * (x0 as f32);
+        let mut ay = base_ay + m[1][0] * (x0 as f32);
+        for x in x0..x1 {
+            let px = ax;
+            let py = ay;
+            ax += m[0][0];
+            ay += m[1][0];
+            // Skip if outside the 128×128 aligned square. Use strict `>=` on
+            // the upper bound because we sample at (ix, ix+1) / (iy, iy+1)
+            // for bilinear interp, so the last valid source coord is cw-1
+            // *exclusive*.
+            if px < 0.0 || py < 0.0 || px >= (cw as f32) - 1.0 || py >= (ch as f32) - 1.0 {
+                continue;
             }
-        });
-    RgbImage::from_raw(w as u32, h as u32, out_vec).expect("RgbImage from_raw")
+            let ix = px as i32;
+            let iy = py as i32;
+            let dx = px - ix as f32;
+            let dy = py - iy as f32;
+            let w00 = (1.0 - dx) * (1.0 - dy);
+            let w10 = dx * (1.0 - dy);
+            let w01 = (1.0 - dx) * dy;
+            let w11 = dx * dy;
+
+            let m00 = mask_buf[(iy as usize) * cw_us + ix as usize] as f32;
+            let m10 = mask_buf[(iy as usize) * cw_us + (ix + 1) as usize] as f32;
+            let m01 = mask_buf[((iy + 1) as usize) * cw_us + ix as usize] as f32;
+            let m11 = mask_buf[((iy + 1) as usize) * cw_us + (ix + 1) as usize] as f32;
+            let alpha = (m00 * w00 + m10 * w10 + m01 * w01 + m11 * w11) * (1.0 / 255.0);
+            if alpha <= 0.0 {
+                continue;
+            }
+
+            let c00 = ((iy as usize) * cw_us + ix as usize) * 3;
+            let c10 = ((iy as usize) * cw_us + (ix + 1) as usize) * 3;
+            let c01 = (((iy + 1) as usize) * cw_us + ix as usize) * 3;
+            let c11 = (((iy + 1) as usize) * cw_us + (ix + 1) as usize) * 3;
+            let r = crop_buf[c00] as f32 * w00
+                + crop_buf[c10] as f32 * w10
+                + crop_buf[c01] as f32 * w01
+                + crop_buf[c11] as f32 * w11;
+            let g = crop_buf[c00 + 1] as f32 * w00
+                + crop_buf[c10 + 1] as f32 * w10
+                + crop_buf[c01 + 1] as f32 * w01
+                + crop_buf[c11 + 1] as f32 * w11;
+            let b = crop_buf[c00 + 2] as f32 * w00
+                + crop_buf[c10 + 2] as f32 * w10
+                + crop_buf[c01 + 2] as f32 * w01
+                + crop_buf[c11 + 2] as f32 * w11;
+
+            let pi = ((y as usize) * (bw as usize) + x as usize) * 3;
+            let ia = 1.0 - alpha;
+            out_vec[pi] = (r * alpha + base_buf[pi] as f32 * ia) as u8;
+            out_vec[pi + 1] = (g * alpha + base_buf[pi + 1] as f32 * ia) as u8;
+            out_vec[pi + 2] = (b * alpha + base_buf[pi + 2] as f32 * ia) as u8;
+        }
+    }
+
+    RgbImage::from_raw(bw as u32, bh as u32, out_vec).expect("RgbImage from_raw")
 }
 
 fn build_oval_mask(w: u32, h: u32, radius_frac: f32) -> image::GrayImage {
@@ -259,33 +380,6 @@ fn build_oval_mask(w: u32, h: u32, radius_frac: f32) -> image::GrayImage {
         }
     }
     mask
-}
-
-fn warp_rgb_with_affine(src: &RgbImage, m: [[f32; 3]; 2], w: u32, h: u32) -> RgbImage {
-    use imageproc::geometric_transformations::{warp_into, Interpolation, Projection};
-    let proj = Projection::from_matrix([
-        m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], 0.0, 0.0, 1.0,
-    ])
-    .unwrap_or(Projection::scale(1.0, 1.0));
-    let mut out = RgbImage::from_pixel(w, h, Rgb([0, 0, 0]));
-    warp_into(src, &proj, Interpolation::Bilinear, Rgb([0, 0, 0]), &mut out);
-    out
-}
-
-fn warp_gray_with_affine(
-    src: &image::GrayImage,
-    m: [[f32; 3]; 2],
-    w: u32,
-    h: u32,
-) -> image::GrayImage {
-    use imageproc::geometric_transformations::{warp_into, Interpolation, Projection};
-    let proj = Projection::from_matrix([
-        m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], 0.0, 0.0, 1.0,
-    ])
-    .unwrap_or(Projection::scale(1.0, 1.0));
-    let mut out = image::GrayImage::from_pixel(w, h, image::Luma([0]));
-    warp_into(src, &proj, Interpolation::Bilinear, image::Luma([0]), &mut out);
-    out
 }
 
 fn invert_affine(m: [[f32; 3]; 2]) -> [[f32; 3]; 2] {

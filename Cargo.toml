@@ -19,8 +19,6 @@ nokhwa = { version = "0.10", features = ["input-native"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 imageproc = "0.25"
 
-# ONNX runtime (InsightFace models)
-ort = { version = "2.0.0-rc.9", features = ["download-binaries"] }
 ndarray = "0.16"
 
 # Misc
@@ -40,6 +38,17 @@ rfd = "0.15"
 
 # Small sync HTTP client for the in-app starter-gallery downloader.
 ureq = { version = "2", features = ["json", "tls"], default-features = false }
+
+# ONNX runtime. On Windows we also enable the DirectML execution provider
+# so any DX12-capable GPU (NVIDIA/AMD/Intel iGPU) can accelerate the
+# inswapper inference. On macOS/Linux the CPU provider is used and the
+# app still runs unchanged. Users can force CPU-only on Windows by setting
+# `FACENAISSANCE_NO_DML=1` in the environment.
+[target.'cfg(target_os = "windows")'.dependencies]
+ort = { version = "2.0.0-rc.9", features = ["download-binaries", "directml"] }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+ort = { version = "2.0.0-rc.9", features = ["download-binaries"] }
 
 [profile.release]
 lto = "thin"

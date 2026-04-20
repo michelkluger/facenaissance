@@ -198,15 +198,16 @@ fn image_to_chw(img: &RgbImage, mean: f32, std: f32) -> ([i64; 4], Vec<f32>) {
     let w = img.width() as i64;
     let h = img.height() as i64;
     let plane = (w * h) as usize;
+    let raw = img.as_raw(); // packed RGBRGB...
     let mut data = vec![0.0f32; 3 * plane];
-    for y in 0..h as u32 {
-        for x in 0..w as u32 {
-            let p = img.get_pixel(x, y);
-            let i = (y as i64 * w + x as i64) as usize;
-            data[i] = (p[0] as f32 - mean) / std;
-            data[plane + i] = (p[1] as f32 - mean) / std;
-            data[2 * plane + i] = (p[2] as f32 - mean) / std;
-        }
+    let (r_plane, rest) = data.split_at_mut(plane);
+    let (g_plane, b_plane) = rest.split_at_mut(plane);
+    let inv_std = 1.0 / std;
+    for i in 0..plane {
+        let p = i * 3;
+        r_plane[i] = (raw[p] as f32 - mean) * inv_std;
+        g_plane[i] = (raw[p + 1] as f32 - mean) * inv_std;
+        b_plane[i] = (raw[p + 2] as f32 - mean) * inv_std;
     }
     ([1, 3, h, w], data)
 }

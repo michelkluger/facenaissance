@@ -8,7 +8,7 @@
 
 use crate::camera::{self, CameraFeed};
 use crate::downloader::{self, DownloadMsg, Downloader};
-use crate::pipeline::{self, SwapRequest, SwapResult, Worker, WorkerMsg, WorkerReq};
+use crate::pipeline::{self, BatchTiming, SwapRequest, SwapResult, Worker, WorkerMsg, WorkerReq};
 use anyhow::Result;
 use eframe::CreationContext;
 use egui::{ColorImage, TextureHandle, TextureOptions};
@@ -48,6 +48,9 @@ pub struct FacenaissanceApp {
     downloader: Option<Downloader>,
     /// UI-side snapshot of the downloader's progress.
     download_progress: Option<DownloadStatus>,
+    /// Timing of the last completed capture batch — drives the badge shown
+    /// above the gallery so you can eyeball perf-regressions at a glance.
+    last_timing: Option<BatchTiming>,
 }
 
 struct DownloadStatus {
@@ -108,6 +111,7 @@ impl FacenaissanceApp {
             processing: false,
             downloader,
             download_progress: None,
+            last_timing: None,
         })
     }
 
@@ -175,9 +179,9 @@ impl FacenaissanceApp {
                 WorkerMsg::UserFace(img) => {
                     self.user_face_tex = Some(rgb_to_texture(ctx, &img, "user_face"));
                 }
-                WorkerMsg::Results(r) => {
+                WorkerMsg::Results { items, timing } => {
                     self.results.clear();
-                    for res in r {
+                    for res in items {
                         let tex = rgb_to_texture(ctx, &res.image, &res.painting_title);
                         self.results.push(GalleryItem {
                             title: res.painting_title,
@@ -192,7 +196,13 @@ impl FacenaissanceApp {
                     }
                     self.processing = false;
                     self.progress = None;
-                    self.status = format!("Done — {} results", self.results.len());
+                    self.last_timing = Some(timing);
+                    let secs = timing.wall_ms as f32 / 1000.0;
+                    self.status = format!(
+                        "Done — {} results in {:.1}s",
+                        self.results.len(),
+                        secs
+                    );
                 }
                 WorkerMsg::Error(e) => {
                     self.status = format!("Error: {e}");
@@ -583,7 +593,30 @@ impl eframe::App for FacenaissanceApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("You in classical paintings");
+            ui.horizontal(|ui| {
+                ui.heading("You in classical paintings");
+                if let Some(t) = self.last_timing {
+                    let secs = t.wall_ms as f32 / 1000.0;
+                    let txt = if t.count > 0 {
+                        format!(
+                            "⏱  {:.2}s total · {} swaps · avg infer {}ms · paste {}ms · align {}ms",
+                            secs, t.count, t.infer_avg_ms, t.paste_avg_ms, t.align_avg_ms,
+                        )
+                    } else {
+                        format!("⏱  {:.2}s total", secs)
+                    };
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new(txt)
+                                    .monospace()
+                                    .color(egui::Color32::from_rgb(120, 200, 120)),
+                            );
+                        },
+                    );
+                }
+            });
             if self.results.is_empty() {
                 ui.label("Hit Capture to see yourself fitted into the best-matching paintings.");
                 return;
